@@ -1,0 +1,538 @@
+**合并方案**
+
+**波兰认证合并到正式版本 V2.1.10 的改动方案**
+
+日期：2026-09-16
+
+状态：源码对比及实施设计。本次仅编写方案，未修改固件、未编译、未烧录、未进行台架或认证测试。
+
+文件要求：使用普通 UTF-8 明文，写入后重新读取验证，避免加密头或乱码。
+
+**1\. 结论与合并基线**
+
+采用"正式版 DSP 协议保持稳定 + 独立 SunSpec 映像 + 显式字段适配 + 统一控制仲裁"的方式合并。
+
+不能整体覆盖 ac_protocol.h/c，也不能把波兰版 DSP 回读结构体直接替换进正式版。DSP 不变，ARM 对 DSP 的字段顺序、地址、长度、单位和位定义必须只有一套有效约定。
+
+本次核对目录，以下分别简写为 P、R：
+
+- P：D:\\Code\\backup\\2501_4000mix\\aodili_syn2.1.6-polan_add40000_26.09.02\\A2501_A2502_APP_V2.x.x_CAN_LM\\A2501_A2502_APP_V2.x.x_CAN_LM
+- R：D:\\Code\\release\\2501_4000mix\\A2501_A2502_APP_V2.1.10_CAN\\A2501_A2502_APP_V2.1.10_CAN
+- 本文：P\\Doc\\波兰认证合并方案.txt。
+
+"DSP 代码相同"按用户给定前提处理；本次没有比较 DSP 源码或二进制，也没有读取实机协议。R 的 DSP 布局作为开发基线，实施前须用同一 DSP 的实际回包或通信表确认关键冲突项。若实机与 R 不符，应修正共同适配层并回归全部消费者，不能让认证和普通路径按两套冲突布局解释同一回包。
+
+目标为同一正式固件同时保留 App、HEMS、CT、PowerHub、BMS、OTA 和波兰 Modbus。互不冲突必须同时满足：报文不串位、控制权不争写、Flash 不覆盖、通信资源不互相破坏。
+
+**2\. 已确认冲突及取舍**
+
+以下来自本次磁盘源码；注释中的寄存器号不替代实际 sizeof/offsetof 和 DSP 回包验证。
+
+**2.1 DSP 运行数据回读**
+
+位置：两版 Ac_Protocol/ac_protocol.h 的 Ac_tstrRdRegType；R 约 235～348 行，P 约 235～344 行。
+
+| 项目                  | R 正式版                                                                                            | P 波兰版                | 合并处理                             |
+| --------------------- | --------------------------------------------------------------------------------------------------- | ----------------------- | ------------------------------------ |
+| DSP_Reg_RUNRD_Len     | 0x6E，110 字                                                                                        | 0x6A，106 字            | 保留 R 长度及结构                    |
+| 槽 5 / 6              | Onlinestate / DcdcState                                                                             | DcdcState / Onlinestate | 保留 R 顺序，SunSpec 按字段取值      |
+| 106～109              | s16GridPowerGradientGridPowerP、s16FeedGridInvCntlGridPowerPref、s16GridCtlPower、u16PvLowPowerFlag | 无这些字段              | 全部保留，不能截短                   |
+| u16InvVoltDC 单位注释 | 0.01                                                                                                | 0.001                   | 需核对共同 DSP，不能按注释直接改倍率 |
+| u16Pv1Power 单位注释  | 0.01                                                                                                | 1                       | 需核对共同 DSP，不能盲目乘除 100     |
+
+Bms_Protocol/api_can.c 对运行回包先判断 actual_data_len == sizeof(Ac_tstrRdReg.Info)，再 memcpy。改短结构不仅会丢尾部数据，还可能使回包被忽略；顺序错但长度相同则会静默串位。这个位于 Bms_Protocol 下的模块实际也负责 DSP 接收，必须纳入合并范围。
+
+SnapshortReadStartFlag 是 u8，但报文按 16 位寄存器组织。必须用目标 Keil 构建验证该位置填充和后续 offsetof，不能用"字段数量乘 2"代替。保留原位域、pack 和编译选项。
+
+**2.2 DSP 控制回读大幅重排**
+
+位置：R ac_protocol.h:671～735；P ac_protocol.h:756～836。
+
+| 控制地址 | R 含义                            | P 回读结构含义                 |
+| -------- | --------------------------------- | ------------------------------ |
+| 0        | SysReset                          | AcStatus                       |
+| 1        | TestFlag                          | SysReset                       |
+| 2        | ARMSendCmdDisable                 | TestFlag                       |
+| 3        | RelayStatus                       | GridCurrentRef                 |
+| 4        | GridCurrentRef                    | GridCurrentDCRef               |
+| 5        | GridCurrentDCRef                  | Activepower                    |
+| 6 / 7    | ReActivepower / ActivepowerFactor | 同名字段                       |
+| 8 / 9    | AcStatus / Activepower            | GridoffCtrlFlg / ChargeStatus  |
+| 10 / 11  | GridoffCtrlFlg / ChargeStatus     | CtrlMode / RelayStatus         |
+| 12 / 13  | CtrlMode / DisChgPowerMaxAllw     | BatPackCtrl / AcPvCtrl         |
+| 14 / 15  | BatPackCtrl / AcPvCtrl            | PhaseLine / DisChgPowerMaxAllw |
+| 16 / 17  | PhaseLine / CtPower               | CtPower / ARMSendCmdDisable    |
+| 18       | IsHems                            | 无，只有 18 字                 |
+
+R 的 DSP_Reg_CtrlRD_Len=19，P=18。合并保留 R 的 Ac_tstrChgCtrlRegType 和回读长度。尤其 ARMSendCmdDisable 必须按共同协议取值；照搬 P 会把 R 的 CT 功率槽 17 误作禁止标志。
+
+**2.3 控制写结构与回读不能混为一谈**
+
+R 的 Ac_tstrChgCtrlRegType_W 从地址 8 到 18，共 11 字，最后为 IsHems；P 从 6 到 17，共 12 字，新增 Q/PF 但删除 HEMS。
+
+P 的写结构仍是 reg8=AcStatus、reg9=Activepower，和 P 自己的回读结构也不一致。不能以波兰功能曾经可读写为理由整体采用该布局。
+
+CtrlCmdStartAddr 在 R 为 8、P 为 6。只改这个宏或只复制结构体都会错位。R PF 注释为 0.01，P 为 0.001；P 默认 PF=1000 不能在未确认 DSP 定标前直接使用。
+
+**2.4 正式版能力不可被旧分支覆盖**
+
+- R ac_protocol.c:320 的 Ac_vidReStartCmdSend 和 :431 的 u16IsHems 下发必须保留。
+- R Rte_Data.h 中 u8APP_SysOffAndReStart、u8APP_IsHems、u8PvPowerUnderFlag、u8AcCoupleReverseFlag 不可被 P 的旧结构替换。
+- DSP_Data_Struct、动态数据、设备参数、快照、OTA、充放电/加热等按 R 保留，波兰变更按功能提取。
+- P 虽新增 Ac_tstrSetParaInfoTypeAll / Ac_tstrSetAllParaTypeR（127 字），周期轮询仍为 DSP_Reg_SetRD_Len=1。不能将新增类型误认为已经打通全表读取，更不能把原一字并网参数缓存直接扩成全表并修改既有收发。
+
+**3\. 数据分层与模块边界**
+
+建议新增下列模块（拟定名称，本次未创建）：
+
+- Poland/poland_sunspec.h/c：各 model 的 ID/L、偏移、可写范围和大端映像。
+- Poland/poland_adapter.h/c：正式测量字段与 SunSpec 字段之间的定标、符号、状态转换，以及参数提交接口。
+- Poland/poland_control.h/c：波兰请求、有效位、所有者和回退状态，由 PMS 周期统一消费。
+
+也可先在原文件中分区合入再拆分，但职责必须独立。
+
+485 -> ESP -> 0x1060 RTU -> Modbus 校验 -> SunSpec 映像
+
+\-> 语义请求 -> PMS 仲裁/参数队列 -> 正式 DSP 编码 -> CAN -> DSP
+
+DSP -> 正式 CAN 解码 -> 正式测量快照 -> SunSpec 映像
+
+\-> RTU 应答 -> ESP -> 485
+
+禁止把 SunSpec 结构体强转为 DSP 结构体，禁止以 model off 作为 DSP 地址，禁止把大端 backing store 原样 memcpy 给 DSP，禁止通信回调与 PMS 同时修改最终输出。
+
+SunSpec pack 必须成对 push/pop，不能改变后续 DSP 类型对齐。RTU 数据大端、RTU CRC 字节顺序及内部 DSP 帧的字节序分别处理，不做不加区分的整包换序。
+
+**4\. DSP 适配的具体改法**
+
+**4.1 回读保持唯一数据源**
+
+Ac_tstrRdRegType、Ac_tstrCtrlRegType、Ac_tstrSetDevParaType、Ac_tstrSetParaType 和原轮询长度以 R 为底。Ac_vidPolandRdModelRefresh 逐字段读取正式 Info，不按 P 偏移访问原始包。
+
+Model 701 逐项核对 V/A/Hz/W/Var/PF 的单位、方向与状态位。Model 714 逐项核对端口类型和来源；P 当前 PrtTyp 写 PV，必须确认所用测量确实代表该端口。未实现/无效值按对应 SunSpec 类型表示，不能以有效零冒充缺失数据。
+
+使用带有效/更新时间的一致快照构造应答；DSP 超时不能永久回报旧正常状态，多字数据不能在并发更新中撕裂。
+
+**4.2 推荐：原控制帧不变，新增 reg6～7 专用写**
+
+实现 A（优先）：
+
+1. R 周期写仍为地址 8、数量 11，完整覆盖 8～18，保留 HEMS、CT、相位和原有控制。
+2. 新增 reg6～7 专用消息，使用正式 Function_Code_CtrlCmd_W（当前宏为 0x04），StartAddr=6、Count=2。两个值分别为经确认定标的有符号 Q、PF。
+3. 帧长、载荷端序、CRC 沿用 R 协议构造；头文件结构上的"0x05"旧注释不能替代实际功能码宏。
+4. 只有相应波兰功能启用且拥有控制权时发送；禁用/释放时同时恢复合法的本地模式和值，不能仅停止发送而让 DSP 保留旧远程 Q/PF。
+5. 两种帧进入统一队列，按完整逻辑帧串行发送，防止 CAN 分片穿插。模式参数 0x0C 和 Q/PF 数值有确定应用顺序。
+6. 必须确认 DSP 接受地址 6、数量 2 的部分写，以及设定是保持型还是需周期刷新；需要周期刷新时接入原调度，不只在 Modbus 写入时发一次。
+
+实现 B（DSP 若要求连续周期写）：新增独立的 6～18 扩展写帧，共 13 字，前两字 Q/PF，后面完整保留 R 的 8～18，最后为 IsHems。普通路径可继续用原帧。禁止采用 P 的 6～17 结构，也不改变 0～18 回读结构。
+
+A/B 的选择依据为共同 DSP 解析代码或实测报文，不是 ARM 能否编译。无需创建两套"波兰 DSP/普通 DSP"回读协议。
+
+**4.3 并网参数使用显式地址与单位表**
+
+P ac_protocol.c:586～609 使用 offsetof(Ac_tstrSetParaInfoTypeAll, member)/2 推导地址。正式合并建议集中为固定协议常量，附单位和有效范围，不使地址随业务结构体增删变化。
+
+下面为 P 当前源码推导的候选映射，须对照同一 DSP，不代表本次实机确认：
+
+| SunSpec 字段          | DSP 并网地址（零基）         | 转换与合并要求                                                  |
+| --------------------- | ---------------------------- | --------------------------------------------------------------- |
+| 702.VNom              | 1，RatedVolt                 | V -> 1V，校验额定范围                                           |
+| 702.WMax              | 3，RatedPower                | P 映射额定功率；W 与 DSP 额定 VA 语义须确认，不可直接等同限功率 |
+| 703.ESDlyTms          | 4，ConnectToNetTime          | 秒，u32 转 u16 前校验，禁止截断                                 |
+| 703.ESVHi / ESVLo     | 10 / 11                      | P 换算为 0.1%Un；确认额定电压基准                               |
+| 703.ESHzHi / ESHzLo   | 12 / 13                      | Hz -> 0.01Hz，校验后换算                                        |
+| 704.WRmp              | 14，NorPowGrad               | P 乘 60（每秒 -> 每分钟），检查乘积上限及参考功率               |
+| 704.PF / Var 模式     | 17，ReactivePowerControlMode | P 为 0=固定无功、1=固定PF；只能选一个                           |
+| 704.AntiIslEna        | 18，IslandDetectionEnable    | 仅允许共同 DSP 已定义的值                                       |
+| 704.VarSet / PFWInjPF | 控制表 6 / 7，不是并网参数表 | 走专用控制写，不走 0x0C                                         |
+
+保留原并网标准寄存器 0 的正式入口。App 切换并网标准可能使 DSP 重装默认值，应统一为"切标准 -> 确认完成 -> 重放该标准允许的有效覆盖参数 -> 刷新映像"，不能让 App 和波兰任务轮流覆盖。
+
+参数请求带来源、地址、值、结果状态，串行进入 CAN 队列。优先使用 DSP 已有确认；新增读回时按请求起址/长度独立分派，不能将全表回包 memcpy 到原 1 字缓存。未修改的参数不随整表重写。
+
+**5\. 控制权与功能闭环**
+
+**5.1 最终输出只在 PMS 统一形成**
+
+保留 R 的故障、BMS、SOC、温度、功率、加热、OTA 等约束；波兰控制只能在这些边界内生效。推荐每周期：
+
+1. 计算原正式策略及安全边界。
+2. 根据本地/远程模式、功能 Ena 和有效请求选择唯一控制来源。
+3. 将该来源的设定施加到目标值，执行正式最大/最小允许值约束。
+4. 最后应用停机/进服禁止门控，形成一次最终 DSP 控制快照。
+
+无有效波兰配置的首次升级保持正式行为；普通 Modbus 读操作不抢控制权、不改变 DA。"互不冲突"不表示允许两个来源同时命令相反功率，必须能区分请求值和实际生效值。
+
+ES=0 在波兰功能启用时持续禁止进服，App START 不能绕过；ES=1 仅解除该禁止，不越过故障、SOC 或本地停机条件。
+
+P 的 POLAND_ES_GATE_EN=1 和 api_pms.c:233 的门控可作为移植入口，但不能照抄"认证通过后设 0"的注释而在交付版关闭已声明支持的功能。
+
+**5.2 必须修正 P 的冲突行为**
+
+- OpCtl：P ac_protocol.c 直接写 u8SysStartUpCmd，可能下一周期被 PMS 覆盖。改为有有效状态的启停请求/状态机输入；STOP 持续到有效解除，START 走正式启动条件。待机命令值 2 未确认前不能直接发送并宣称支持。
+- LocRemCtl：P:1566～1570 的 LOCAL 会停止整包周期控制。正式合并应隔离远程 SunSpec 控制权，同时继续本地 PMS、BMS/加热/HEMS 必要控制。LOCAL/REMOTE 的权限以产品及认证定义确认；不能直接等同 DSP 原有 ARMSendCmdDisable。
+- ARMSendCmdDisable：保留正式地址 2 及原发送约束，不能按 P 地址 17 读。
+- PF/无功：同一请求同时启用两种模式，应明确拒绝或采用已确认的互斥规则，不能依赖两个 if 的先后。释放时同时处理模式和值。
+- AlarmReset：P 实际只自清零；不能连接 Ac_vidReStartCmdSend 来模拟清告警，后者是真复位。只有 DSP 已有明确清告警机制时才接入。
+- ControllerHb：P 只记录变化，没有失联超时策略；不能声称已实现看门狗。需要此能力时在 ARM 实现计时与回退，保留本地安全控制。
+
+**5.3 "可写映像"不等于"功能已执行"**
+
+P 的 Model 704 仍有 WSet、WMaxLimPct、吸收 PF、回退计时器、VarRmp 等 TODO；703.ESRmpTms 当前仅 ARM 读写和保存，不能等同已执行进服爬坡；702 也有只写映像而无 DSP 映射的能力项。
+
+逐点建立"读写声明 -> 语义值 -> 执行者 -> 反馈 -> 保存/重启"的表：
+
+- DSP 已支持：按真实地址适配并验证。
+- ARM 可实现：在 PMS 中实现限功率/计时/斜坡，仍受正式边界限制。
+- 两侧均不能实现：按实际能力调整可写性、未实现值和 PICS；若为认证必需项，明确列为发布阻断，不能靠降低声明掩盖缺失。
+
+Modbus 正常写应答仅代表协议接受，不证明 DSP 已执行。数值不支持或发送队列满时应提交前拒绝；异步 DSP 超时留下明确状态和有限重试。多寄存器/跨 model 写先完成全部校验再提交，避免后段失败但前段已下发。
+
+**6\. Modbus、ESP 与原通信共存**
+
+**6.1 固定地址与可写权限**
+
+P 当前 NPrt=1 地图：40000/0x9C40 的 SunS；Model 1=40002、701=40070、702=40225、703=40277、704=40296、714=40363、715=40408、End=40417～40418。不可混成 0x4000，也不可再人为减 40001。
+
+保留 0x03/0x04/0x06/0x10、CRC、数量上限、广播、跨 model、只读空洞、枚举、完整 32 位写等校验。原 Modbus_Read_Reg / Modbus_Write_Mult_Reg、MPPT 和正式 RS485 路径继续保留。
+
+702 保留 52 字布局和 Ac_MbRwM702={{26,2},{29,1},{31,11},{44,1}}。off28/30/42/43 四个 PF 点返回 0xFFFF；P 对 0x06 命中只读报异常、0x10 只读点有忽略规则，移植不擅自改动，需以认证用例回归。703.ESRndTms 当前不在可写表内，不能因合并恢复 supported。
+
+**6.2 ESP 隧道与 DA 整套迁移**
+
+涉及 esp_parameter.h/c、esp_datahandle.c、modul_modbus.h/c 和 DA_ESP_V1.txt：
+
+- 0x1060 的 value 为完整 RTU 帧含 CRC，空闲为 00 00；普通应答一次消费与 DA 应答保留规则分别处理。
+- 0x1061 使用独立 SYNC/APPLIED/FAILED 协调、事务匹配、重复查询和广播语义。源码仍注明此 Type 待 ESP 确认，不能把 ARM 未撞号当端到端确认。
+- 写 40068 改 DA，ESP 应先用旧地址应答，再切实际站址并确认；实际 DA 由 ESP 持久化，ARM 保存协调状态。普通请求不得隐式改址。
+- 覆盖 ARM 单独重启、ESP 单独重启、整机重启、重复请求、确认丢包、pending 期间新事务。
+- 保留正式 TLV、队列顺序、命令解析和 OTA；只增量加入波兰项，不能整包覆盖旧属性表。
+
+R 的 ESP_SEND_MAX_LEN / USART2_TXBUFF_SIZE 均为 1284，P 为 1536。配套检查缓冲、队列、DMA 及任务栈，并用 R 的完整属性表重算最大报文。P 文档的总帧长度不是 R 的上界；考虑最大 256 字节 RTU 与外层 TLV/AA55 开销。
+
+DA 协调协议 V1（原 Doc/DA_ESP_V1.txt）内容整体并入本方案，作为 6.2.1～6.2.10。原文档状态："ARM 侧实现及本机测试已完成；ESP 侧 Type 分配、解析和实际 RS485 行为待对齐"，对应第 10 节第 5 项待确认。
+
+**6.2.1 分工和本次改动**
+
+Model 1 DA仍位于寄存器40068(0x9C84)，L=66，Pad=40069，布局不变。
+
+合法DA为1..247，支持FC06和FC10；FC10改DA时必须单独写一个寄存器。
+
+ARM校验写入并建立待处理事务。ESP是RS485地址筛选和掉电保存的唯一所有者。
+
+ARM只在ESP成功确认后更新DA映像及自身站址过滤；普通RTU请求不会覆盖DA。
+
+DSP不参与DA改址。ARM不重复保存DA到Flash，启动时由ESP明确同步实际地址。
+
+必须双端配套：ESP未完成SYNC前，ARM仍允许默认地址1的普通读写，
+
+但合法DA写请求返回异常06(Busy)，不再返回虚假的改址成功。
+
+地址0只是广播目的地址，不是允许写入DA的值。非法值仍返回异常03；广播不回RTU。
+
+**6.2.2 承载方式（需要ESP确认）**
+
+1. 保留TLV Type=0x1060：Value为完整原始RTU帧(含Modbus CRC)。
+
+空闲仍为Length=2、Value=00 00。不能在RTU Value前后插入新字段。
+
+1. 新增TLV Type=0x1061（暂定，ARM当前属性表无冲突，仍须核对ESP及平台分配）。
+
+双向Value固定12字节。该消息仅在ARM/ESP内部使用，不转发到RS485/云端控制口。
+
+1. ESP写控制：沿用AA55协议FRAME_TYPE_WRITE=0x02，一帧只带一个0x1061 TLV。
+
+TLV为10 61 00 0C + 下文12字节Value，外层头/流水/CRC沿用现有协议。
+
+1. ESP读状态：FRAME_TYPE_READ=0x01，读请求属性部分为10 61 00 01。
+
+注意读请求的0001表示属性个数，不是12字节Value长度。
+
+ARM写控制不另发即时写回包；ESP用随后属性查询确认状态。
+
+1. 0x1061追加在上报表末尾，原属性顺序不变。推荐显式轮询此Type，
+
+或调整全量查询个数；本配置164项，上报最大125寄存器RTU读应答时共1360字节，
+
+小于现有1536字节发送缓冲区（已用实际协议/上报表做本机验证）。
+
+1. Session和Sequence按大端传输，禁止依赖C结构体内存布局。
+
+12字节Value在现有TLV编解码中整体透传，不走短整数字节翻转分支。
+
+**6.2.3 ARM -> ESP 状态Value（12字节）**
+
+偏移 长度 含义
+
+0 1 Version，固定01
+
+1 1 State：00=UNSYNCED；01=READY；02=PENDING
+
+2..3 2 Session，会话号，由ESP在同步时指定，非0
+
+4..5 2 Sequence，ARM每接受一笔DA写递增，跳过0；同步后为0
+
+6 1 OldDA，本次改址前的地址
+
+7 1 NewDA，本次请求的新地址
+
+8 1 RequestDA，原RTU请求首字节；00表示广播
+
+9 1 Function，06或10；同步后的初始值为00
+
+10 1 ActiveDA，ARM已经确认生效的地址
+
+11 1 Result：00=无结果/等待；01=已应用；02=应用失败
+
+READY后的OldDA/NewDA/Sequence/Result保留最近一次事务，用于核对ACK是否被ARM接收。
+
+PENDING期间ActiveDA及寄存器40068仍为旧地址，直到收到匹配的APPLIED确认。
+
+重复读取不消费状态。等待确认期间不接收新的0x1060事务，防止覆盖待处理应答。
+
+**6.2.4 ESP -> ARM 控制Value（12字节）**
+
+偏移0为Version=01；偏移1改为Command：01=SYNC，02=APPLIED，03=FAILED。
+
+偏移2..9与上述字段相同；偏移10为ESP实际生效地址；偏移11必须为00。
+
+SYNC（启动、重连或不确定状态恢复）：
+
+Session=ESP新生成的非0会话；Sequence=0；OldDA=NewDA=ActiveDA=实际地址；
+
+RequestDA=0；Function=0；Result=0。
+
+ESP应先暂停RTU转发、清空旧内部队列、确定NVS和当前筛选地址，再发送SYNC。
+
+ARM收到新会话后清除旧待处理事务和RTU缓存，并更新DA及地址筛选。
+
+同会话SYNC重传无副作用，不会取消正在进行的改址，也不能用它改地址。
+
+查询看到READY、匹配Session、Sequence=0和正确ActiveDA后再开放RTU转发。
+
+APPLIED：
+
+回传PENDING中的Session/Sequence/OldDA/NewDA/RequestDA/Function；
+
+偏移10填NewDA，偏移11填0。ARM匹配后更新DA，READY，Result=01。
+
+FAILED：
+
+回传相同事务字段；偏移10填OldDA，偏移11填0。
+
+仅在ESP确定没有切换、且旧地址仍有效时发送；ARM保留旧DA，READY，Result=02。
+
+错误版本、长度、字段、过期会话/流水及重复ACK均不改变状态。
+
+重复ACK也不会清掉后来普通RTU请求的缓存应答。
+
+错误控制命令不单独产生错误TLV：ESP通过状态未改变判断未被接受。
+
+**6.2.5 单播改址时序（例：1 -> 25）**
+
+1. 主站向地址1写40068=25。ESP保留完整原请求，通过0x1060转发ARM。
+2. ARM校验后建立PENDING事件，准备旧地址1的正常FC06/FC10应答。
+
+ESP应先读取0x1061，或一次读回0x1060/0x1061并完整解析后再决定如何发送485。
+
+1. ESP校验会话/流水/原请求匹配，保存新DA到NVS并确认成功。
+
+这时继续使用旧地址，暂缓转发新RTU请求。
+
+1. ESP将ARM提供的正常应答按旧地址发到RS485，等待UART发送完成(TX complete)，
+
+然后切换自身RS485地址筛选到NewDA。
+
+1. ESP发送APPLIED，轮询直到ARM为READY、同会话/流水、ActiveDA=25、Result=01。
+
+确认前收到的新地址请求应暂存，确认后再转给ARM，不能提前转发后直接丢弃。
+
+1. 后续地址25可读DA=25；旧地址1不再响应。
+
+DA事务的0x1060正常应答与0x1061事件都会保留到匹配确认，以允许轮询丢包重读。
+
+ESP必须按(Session, Sequence)去重：重复收到候选应答时不能重复发485、重复保存或切址。
+
+普通非DA请求的0x1060应答仍只在一次查询中返回。
+
+若NVS保存失败：不要把候选正常应答发到RS485。ESP在旧地址回复原功能码的
+
+异常04(Server Device Failure，重新计算RTU CRC)，发送FAILED并确认ARM回到READY。
+
+若已经切到新地址，仅ACK丢失，继续重发同一APPLIED，不能再发FAILED或自行回旧地址。
+
+**6.2.6 广播改址时序**
+
+ESP必须将合法地址0的FC06/FC10完整帧转发ARM，不能按"非本站地址"提前丢弃。
+
+ARM校验成功后仍产生PENDING，RequestDA=0，但0x1060保持00 00，不产生RTU应答。
+
+ESP保存NVS、切换筛选地址、发送APPLIED、确认READY；整个过程RS485始终不回复。
+
+失败时保持旧地址并发内部FAILED；即使错误也不能向广播回复Modbus异常帧。
+
+同值写入（例如1->1）仍有事件和确认，ESP可避免不必要的NVS写操作。
+
+**6.2.7 重试、重启和并发约定**
+
+建议沿用200ms轮询；ACK发出后1s仍未确认则重发相同ACK。
+
+建议连续3次无确认后进入通讯故障/重连处理（时限与重试次数需ESP侧确认）。
+
+ARM不自动超时回滚：ACK丢失不能证明ESP尚未切址。PENDING会一直保留到ACK或新会话SYNC。
+
+ESP重连使用新的非0Session并清空旧队列；会话号不得和仍可能在途的旧消息重用。
+
+Sequence达到65535后建议在READY时换新Session同步，避免长期运行流水重用。
+
+ARM重启后状态为UNSYNCED；ESP从其持久化且实际启用的DA重新SYNC。
+
+一次只允许一笔RTU请求在途；DA的0x1061确认命令不受PENDING下0x1060暂停影响。
+
+广播应在单台设备或明确隔离的测试总线上执行，避免多台一起改成相同地址。
+
+FC10含DA和其他寄存器的混合写请求整体拒绝(03)，必须将DA单独写1个寄存器。
+
+**6.2.8 可以直接对照的Value示例（仅内部12字节Value，不含AA55外层和CRC）**
+
+ESP同步当前DA=1，Session=0x1234：
+
+01 01 12 34 00 00 01 01 00 00 01 00
+
+ARM收到地址1的FC06写DA=25，Sequence=1，返回PENDING：
+
+01 02 12 34 00 01 01 19 01 06 01 00
+
+ESP保存、发完旧地址应答并切址后回APPLIED：
+
+01 02 12 34 00 01 01 19 01 06 19 00
+
+ARM返回READY，ActiveDA=25，Result=APPLIED：
+
+01 01 12 34 00 01 01 19 01 06 19 01
+
+下一笔广播FC06从25改到2，Sequence=2，ARM返回PENDING：
+
+01 02 12 34 00 02 19 02 00 06 19 00
+
+对应APPLIED：
+
+01 02 12 34 00 02 19 02 00 06 02 00
+
+**6.2.9 需要ESP同事确认的事项**
+
+1. 0x1061 Type是否可用，V1的12字节定义和0x01/0x02外层读写帧是否接受。
+2. 能否在完成SYNC后才开放RTU；新上报属性是否加入轮询。
+3. 能否以NVS为唯一地址持久化来源，支持1..247并在重启后同步ARM。
+4. 单播旧地址应答TX完成后切址、广播不回包、待确认期间暂存下一帧的时序。
+5. 以Session/Sequence去重、重复轮询应答不重复发送、ACK丢失重试/重连的处理。
+6. NVS失败时抑制正常应答并回异常04；失败确认和已经切址后的处理区别。
+7. FC06和FC10单寄存器写40068均支持；广播帧原始目的地址0不能被改成本站地址。
+
+**6.2.10 DA验证边界**
+
+Tests/da/run_tests.ps1编译并运行生产Modbus/CRC及ESP协议、收发、上报队列源码。
+
+测试替换了MCU类型、寄存器数据源和DSP/OTA等硬件调用；它不代表实机ESP/NVS/RS485通过。
+
+覆盖：合法/非法DA、单播和广播06/10、旧新地址筛选、确认去重、失败/重启恢复、
+
+流水回绕、普通模型写入、事件及DA应答重读、完整164项上报容量。
+
+实际仍需验证：RTU-4/RTU-5、新旧地址读写、掉电保持、NVS失败与内部通讯丢包。
+
+本次不处理RTU-3残帧问题和LabTest端口未打开问题，也未修改PICS表格。
+
+参考：Modbus Application Protocol V1.1b3，异常码章节：
+
+<https://www.modbus.org/file/secure/modbusprotocolspecification.pdf>
+
+以上0x1061、状态机、重试时限为本项目接口约定，不是SunSpec新增寄存器或标准TLV。
+
+**7\. Flash、升级与初始化**
+
+P api_flash.h:194～195 将波兰 A/B 区放在 SOCLIMT_PARAM_B_ADDR 后。R 当前宏定义至 SOC 限值 A/B；这不等于证明后面可直接使用。实施时展开绝对地址，核对代码链接区、全部旧参数/擦除区、OTA 区及芯片擦除粒度。
+
+保持 R 既有参数地址、结构和版本，新增独立 poland 块，建议独立版本、长度、CRC、序号及有效位。不能为增加波兰字段改动全局 PARAM_VERSION，导致旧 App 配置失效。
+
+- 从 2.1.10 升级且无波兰参数：采用不干扰本地策略的默认值，不覆盖旧配置。
+- 从认证版迁移：按旧块实际版本和语义转换，并重新校验范围、能力，不能因 CRC 合法就直接执行全部值。
+- A/B 写入中断可恢复，相同值不反复擦写，固件回退仍可读取原参数。
+- DA 真源仍属于 ESP，ARM 旧保留字段不能覆盖它。
+- 保存配置与有效位；AlarmReset、瞬态 OpCtl 等事件不能在上电盲目重放。
+
+初始化建议：正式参数 -> model 默认及未实现值 -> 校验恢复波兰 RAM 配置 -> ESP 同步 DA -> DSP 就绪并完成标准/基础初始化 -> 重放有效覆盖参数 -> 允许远程控制。
+
+P devTlvInit 中 MbSlave_Init 后调用 Ac_vidPolandFlashParamRestore，合并时应拆开"恢复映像"和"实际下发"，避免 DSP 未就绪丢包或默认参数随后覆盖。DSP 离线恢复复用同一重放机制。
+
+**8\. 按文件实施清单**
+
+| 文件/模块                                          | 合并方式                                                        |
+| -------------------------------------------------- | --------------------------------------------------------------- |
+| Ac_Protocol/ac_protocol.h                          | R 为底；保持 DSP 运行/回读/原写结构；波兰 model 独立新增        |
+| Ac_Protocol/ac_protocol.c                          | 保留 R 调度、HEMS、复位；新增映像刷新、参数队列、Q/PF 发送接口  |
+| Bms_Protocol/api_can.c                             | 保留正式接收长度及布局；若扩参数读回则独立分派并检查边界        |
+| Modul_HAL/Modbus/modul_modbus.h/c                  | 提取 P 从机、地图、DA；保留原主机接口                           |
+| Poland/\*（建议新增）                              | 隔离映像、适配、控制状态，并加入正式工程                        |
+| APP/BusComm/api_pms.c                              | 加入统一仲裁及持续 ES/OpCtl 门控，保留正式状态机                |
+| APP/BusComm/api_flash.h/c                          | 独立 A/B 块与迁移，既有参数不变                                 |
+| Esp32_Protocol/esp_parameter.h/c、esp_datahandle.c | 增量合入 0x1060/0x1061、应答消费、初始化                        |
+| esp_sendbuff.h、MCU_HAL/USART/mcu_usart.h          | 配套容量、队列/栈/RAM/DMA 评估                                  |
+| SWC_RTE/Rte_Data.h/c、api_sys.c 等                 | 保留 R 策略与字段，不用旧版整文件替换                           |
+| Project 工程、产品宏                               | 增量加入文件，保持正式配置；Model 1 版本/型号/SN 取真实产品信息 |
+| Tests/da、认证 PICS                                | 复用现有用例并补正式集成验证；PICS 与交付固件能力一致           |
+
+**9\. 实施阶段及验收标准**
+
+A. 冻结共同 DSP 协议：记录 P/R 关键文件摘要、编译器和 pack、DSP 版本与报文；核实 reg0/2/6/7/8/9/18、运行 reg5/6/106～109、PF 单位；输出 sizeof/offsetof 结果。
+
+B. 先接只读：保持原 DSP 帧不变，接从机、ESP 隧道/DA、测量映射，以已知回包同时核对 App 和 SunSpec。
+
+C. 再接控制：实现参数/Q/PF 适配和 PMS 仲裁，消除 LOCAL 停整帧、OpCtl 被覆盖、HEMS 丢失，并逐点完成能力声明。
+
+D. 保存与恢复：接入独立 Flash、旧版迁移、断电恢复、ARM/ESP/DSP 独立重启与丢包。
+
+E. 完整正式回归与认证回归，通过后方可交付。
+
+| 验证层    | 必测项目                                                                       | 通过标准                                              |
+| --------- | ------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| 构建/布局 | 目标产品编译；DSP sizeof/offsetof；map/RAM/栈；SunSpec ID/L                    | 旧 DSP 布局不变，新增帧正确，无新增编译问题及地址重叠 |
+| DSP 解码  | 回包回放，reg5/6 用不同值，控制 reg2/17/18 用不同值，长短错误帧                | 无串位；错误长度不污染有效数据                        |
+| DSP 编码  | 原 8～18 帧与基线逐字节比较；新 reg6/7；参数地址/数量/CRC                      | 波兰未启用时正式行为不变；Q/PF 不覆盖 HEMS/CT/开关    |
+| 定标      | PF 正负/单位、Q、Hz、VNom、WMax、延时超过 65535、WRmp 乘 60 溢出               | 不截断回绕，不混淆 W/VA、V/%Un，非法值提交前拒绝      |
+| 仲裁      | App/远程相反命令，ES=0 后 App START，STOP 多周期，LOCAL/REMOTE 切换            | 唯一输出，保护有效，本地必要控制不中断                |
+| 功能闭环  | 每个支持项的 RTU 写读、CAN 发回和实际电气动作                                  | 不以 ARM 映像读回代替 DSP/整机生效                    |
+| RTU/DA    | 最大帧、坏 CRC、越界、只读、半个32位、跨model、广播、改址、重复/丢包/重启      | 与约定/用例一致，旧址应答和新址切换正确               |
+| 正式能力  | HEMS、CT、PowerHub、PV低功率、AC耦合/倒灌、BMS、加热、SOC、复位、OTA、快照日志 | 逐项回归通过，无旧分支覆盖造成的退化                  |
+| 参数      | 普通升级、认证迁移、坏CRC、A/B写中断、回退、恢复                               | 正式配置不丢，不重放瞬态事件，生效顺序正确            |
+| 认证      | 明确 PICS 路径，记录 Read req/Read rsp、报告和三端版本                         | 能力与应答一致，串口/工具故障不当作固件结果           |
+
+Tests/da 主机测试仅证明其覆盖的协议行为，不能代替 CAN、DSP 控制或整机认证。历史构建、历史认证报告不能代替本次合并后的测试。
+
+**10\. 实施前需关闭的确认项**
+
+1. 共同 DSP 的真实布局：运行槽 5/6、控制 ARMSendCmdDisable/HEMS、运行尾部字段。
+2. PF 单位和励磁符号；reg6～7 独立写支持及刷新要求。
+3. 702.WMax 与额定功率的关系、703 百分比电压基准、WRmp 单位；认证必需项缺失作为发布阻断。
+4. LOCAL/REMOTE、OpCtl 待机、ControllerHb 失联与回退的产品语义。
+5. ESP 的 0x1061 分配、DA 持久化/确认及最大报文容量。
+6. 正式全 Flash 地址图和两种升级来源的迁移规则。
+
+这些是固件实施/发布的输入条件，不影响本方案成文。本次未声称已完成以上验证。
+
+**11\. 源码证据索引**
+
+行号对应 2026-09-16 磁盘内容；后续以符号为准。
+
+- R Ac_Protocol/ac_protocol.h:56～66、235～348、671～735：读长度、尾部字段、控制回读与周期写。
+- P Ac_Protocol/ac_protocol.h:56～66、108、235～344、430～569、756～836：认证结构重排、全参数表、Q/PF 写结构。
+- R Bms_Protocol/api_can.c:845～861：载荷长度匹配后 memcpy。
+- R Ac_Protocol/ac_protocol.c:320～336、428～441：复位、HEMS、正式组帧。
+- P Ac_Protocol/ac_protocol.c:124～144、403～508、586～638：地图/RW、Q/PF、参数地址及写帧。
+- P Ac_Protocol/ac_protocol.c:1014～1203、1540～1611：model 回调、TODO、轮询和 LOCAL 门控。
+- P APP/BusComm/api_pms.c:233～241：ES 门控。
+- P APP/BusComm/api_flash.h:194 起；R 同文件:159～195：新增块、原参数区和共享版本。
+- P Esp32_Protocol/esp_parameter.h:313～322、esp_parameter.c:434～440、esp_datahandle.c:254 起：隧道/DA、初始化和分派。
+- P Esp32_Protocol/DA_ESP_V1.txt：ESP 协调约定及待确认项；协议全文已并入 6.2.1～6.2.10（2026-09-16）。
+
+最终原则：移植波兰协议能力，保留正式数据和控制基线；跨边界字段显式转换，每个输出有唯一仲裁点，每个对外声明都有执行和验证依据。
